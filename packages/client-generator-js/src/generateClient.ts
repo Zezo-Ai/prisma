@@ -32,6 +32,7 @@ import { getPrismaClientDMMF } from './getDMMF'
 import { BrowserJS, JS, TS, TSClient } from './TSClient'
 import { TSClientOptions } from './TSClient/TSClient'
 import { buildTypedSql } from './typedSql/typedSql'
+import { addPreamble, addPreambleToJSFiles } from './utils/addPreamble'
 
 const debug = Debug('prisma:client:generateClient')
 
@@ -121,7 +122,6 @@ export async function buildClient({
     copyEngine,
     datamodel,
     browser: false,
-    deno: false,
     edge: false,
     wasm: false,
   }
@@ -292,26 +292,6 @@ export async function buildClient({
     fileMap['wasm.d.ts'] = fileMap['default.d.ts']
   }
 
-  if (generator.previewFeatures.includes('deno') && !!globalThis.Deno) {
-    // we create a client that is fit for edge runtimes
-    const denoEdgeClient = new TSClient({
-      ...baseClientOptions,
-      runtimeBase: `../${runtimeBase}`,
-      runtimeNameJs: 'edge-esm',
-      runtimeNameTs: 'library.d.ts',
-      deno: true,
-      edge: true,
-    })
-
-    fileMap['deno/edge.js'] = JS(denoEdgeClient)
-    fileMap['deno/index.d.ts'] = TS(denoEdgeClient)
-    fileMap['deno/edge.ts'] = `
-import './polyfill.js'
-// @deno-types="./index.d.ts"
-export * from './edge.js'`
-    fileMap['deno/polyfill.js'] = 'globalThis.process = { env: Deno.env.toObject() }; globalThis.global = globalThis'
-  }
-
   if (typedSql && typedSql.length > 0) {
     const edgeRuntimeName = usesWasmRuntime ? 'wasm' : 'edge'
     const cjsEdgeIndex = `./sql/index.${edgeRuntimeName}.js`
@@ -344,6 +324,8 @@ export * from './edge.js'`
     })
   }
   fileMap['package.json'] = JSON.stringify(pkgJson, null, 2)
+
+  addPreambleToJSFiles(fileMap)
 
   return {
     fileMap, // a map of file names to their contents
@@ -414,6 +396,11 @@ export async function generateClient(options: GenerateClientOptions): Promise<vo
   } = options
 
   const clientEngineType = getClientEngineType(generator)
+
+  if (clientEngineType === ClientEngineType.Client && !generator.previewFeatures.includes('queryCompiler')) {
+    throw new Error('`engineType = "client"` requires enabling the `queryCompiler` preview feature')
+  }
+
   const { runtimeBase, outputDir } = await getGenerationDirs(options)
 
   const { prismaClientDmmf, fileMap } = await buildClient({
@@ -459,9 +446,6 @@ export async function generateClient(options: GenerateClientOptions): Promise<vo
   }
 
   await ensureDir(outputDir)
-  if (generator.previewFeatures.includes('deno') && !!globalThis.Deno) {
-    await ensureDir(path.join(outputDir, 'deno'))
-  }
 
   await writeFileMap(outputDir, fileMap)
 
@@ -738,12 +722,6 @@ function getNodeRuntimeName(engineType: ClientEngineType) {
   }
 
   if (engineType === ClientEngineType.Client) {
-    if (!process.env.PRISMA_UNSTABLE_CLIENT_ENGINE_TYPE) {
-      throw new Error(
-        'Unstable Feature: engineType="client" is in a proof of concept phase and not ready to be used publicly yet!',
-      )
-    }
-
     return 'client'
   }
 
@@ -780,7 +758,19 @@ async function copyRuntimeFiles({ from, to, runtimeName, sourceMaps }: CopyRunti
     files.push(...files.filter((file) => file.endsWith('.js')).map((file) => `${file}.map`))
   }
 
-  await Promise.all(files.map((file) => fs.copyFile(path.join(from, file), path.join(to, file))))
+  await Promise.all(
+    files.map(async (file) => {
+      const sourcePath = path.join(from, file)
+      const targetPath = path.join(to, file)
+
+      if (file.endsWith('.js')) {
+        const content = await fs.readFile(sourcePath, 'utf-8')
+        await fs.writeFile(targetPath, addPreamble(content))
+      } else {
+        await fs.copyFile(sourcePath, targetPath)
+      }
+    }),
+  )
 }
 
 /**

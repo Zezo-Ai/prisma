@@ -1,4 +1,5 @@
 import {
+  BatchResponse,
   CompactedBatchResponse,
   QueryCompiler,
   QueryCompilerConstructor,
@@ -17,6 +18,7 @@ import { Debug } from '@prisma/debug'
 import { Provider, type SqlDriverAdapter } from '@prisma/driver-adapter-utils'
 import { assertNever, TracingHelper } from '@prisma/internals'
 
+import { version as clientVersion } from '../../../../../package.json'
 import { PrismaClientInitializationError } from '../../errors/PrismaClientInitializationError'
 import { PrismaClientKnownRequestError } from '../../errors/PrismaClientKnownRequestError'
 import { PrismaClientRustPanicError } from '../../errors/PrismaClientRustPanicError'
@@ -37,6 +39,24 @@ import { wasmQueryCompilerLoader } from './WasmQueryCompilerLoader'
 const CLIENT_ENGINE_ERROR = 'P2038'
 
 const debug = Debug('prisma:client:clientEngine')
+
+type GlobalWithPanicHandler = typeof globalThis & {
+  PRISMA_WASM_PANIC_REGISTRY: {
+    set_message?: (message: string) => void
+  }
+}
+
+const globalWithPanicHandler = globalThis as GlobalWithPanicHandler
+
+// The fallback panic handler shared across all instances. This ensures that any
+// panic is caught and handled, but each instance should prefer temporarily
+// setting its own local panic handler for the duration of a synchronous WASM
+// function call for better error messages.
+globalWithPanicHandler.PRISMA_WASM_PANIC_REGISTRY = {
+  set_message(message: string) {
+    throw new PrismaClientRustPanicError(message, clientVersion)
+  },
+}
 
 export class ClientEngine implements Engine<undefined> {
   name = 'ClientEngine' as const
@@ -141,17 +161,22 @@ export class ClientEngine implements Engine<undefined> {
     }
 
     try {
-      this.queryCompiler = new this.QueryCompilerConstructor({
-        datamodel: this.datamodel,
-        provider: this.provider,
-        connectionInfo: {},
+      this.#withLocalPanicHandler(() => {
+        this.queryCompiler = new this.QueryCompilerConstructor!({
+          datamodel: this.datamodel,
+          provider: this.provider,
+          connectionInfo: {},
+        })
       })
     } catch (e) {
-      throw this.transformInitError(e)
+      throw this.#transformInitError(e)
     }
   }
 
-  private transformInitError(err: Error): Error {
+  #transformInitError(err: Error): Error {
+    if (err instanceof PrismaClientRustPanicError) {
+      return err
+    }
     try {
       const error: SyncRustError = JSON.parse(err.message)
       return new PrismaClientInitializationError(error.message, this.config.clientVersion!, error.error_code)
@@ -160,7 +185,7 @@ export class ClientEngine implements Engine<undefined> {
     }
   }
 
-  private transformRequestError(err: any): Error {
+  #transformRequestError(err: any): Error {
     if (err instanceof PrismaClientInitializationError) return err
 
     if (err.code === 'GenericFailure' && err.message?.startsWith('PANIC:') && TARGET_BUILD_TYPE !== 'wasm')
@@ -181,6 +206,41 @@ export class ClientEngine implements Engine<undefined> {
       })
     } catch (e) {
       return err
+    }
+  }
+
+  #transformCompileError(error: any): any {
+    if (error instanceof PrismaClientRustPanicError) {
+      return error
+    }
+    if (typeof error['message'] === 'string' && typeof error['code'] === 'string') {
+      return new PrismaClientKnownRequestError(error['message'], {
+        code: error['code'],
+        meta: error.meta,
+        clientVersion: this.config.clientVersion,
+      })
+    } else {
+      return error
+    }
+  }
+
+  #withLocalPanicHandler<T>(fn: () => T): T {
+    const previousHandler = globalWithPanicHandler.PRISMA_WASM_PANIC_REGISTRY.set_message
+    let panic: string | undefined = undefined
+
+    global.PRISMA_WASM_PANIC_REGISTRY.set_message = (message: string) => {
+      panic = message
+    }
+
+    try {
+      return fn()
+    } finally {
+      global.PRISMA_WASM_PANIC_REGISTRY.set_message = previousHandler
+
+      if (panic) {
+        // eslint-disable-next-line no-unsafe-finally
+        throw new PrismaClientRustPanicError(getErrorMessageWithLink(this, panic), this.config.clientVersion!)
+      }
     }
   }
 
@@ -251,7 +311,7 @@ export class ClientEngine implements Engine<undefined> {
         assertNever(action, 'Invalid transaction action.')
       }
     } catch (error) {
-      throw this.transformRequestError(error)
+      throw this.#transformRequestError(error)
     }
 
     return result ? { id: result.id, payload: undefined } : undefined
@@ -266,16 +326,24 @@ export class ClientEngine implements Engine<undefined> {
     const queryStr = JSON.stringify(query)
     this.lastStartedQuery = queryStr
 
-    try {
-      const [adapter, transactionManager] = await this.ensureStarted()
+    const [adapter, transactionManager] = await this.ensureStarted().catch((err) => {
+      throw this.#transformRequestError(err)
+    })
 
-      const queryPlanString = await this.queryCompiler!.compile(queryStr)
+    let queryPlanString: string
+    try {
+      queryPlanString = this.#withLocalPanicHandler(() => this.queryCompiler!.compile(queryStr))
+    } catch (error) {
+      throw this.#transformCompileError(error)
+    }
+
+    try {
       const queryPlan: QueryPlanNode = JSON.parse(queryPlanString)
 
       debug(`query plan created`, queryPlanString)
 
       const queryable = interactiveTransaction
-        ? transactionManager.getTransaction(interactiveTransaction, query.action)
+        ? transactionManager.getTransaction(interactiveTransaction, 'query')
         : adapter
 
       const qiTransactionManager = (
@@ -284,7 +352,7 @@ export class ClientEngine implements Engine<undefined> {
 
       // TODO: ORM-508 - Implement query plan caching by replacing all scalar values in the query with params automatically.
       const placeholderValues = {}
-      const interpreter = new QueryInterpreter({
+      const interpreter = QueryInterpreter.forSql({
         transactionManager: qiTransactionManager,
         placeholderValues,
         onQuery: this.#emitQueryEvent,
@@ -296,7 +364,7 @@ export class ClientEngine implements Engine<undefined> {
 
       return { data: { [query.action]: result } as T }
     } catch (e: any) {
-      throw this.transformRequestError(e)
+      throw this.#transformRequestError(e)
     }
   }
 
@@ -313,11 +381,18 @@ export class ClientEngine implements Engine<undefined> {
 
     this.lastStartedQuery = request
 
+    const [, transactionManager] = await this.ensureStarted().catch((err) => {
+      throw this.#transformRequestError(err)
+    })
+
+    let batchResponse: BatchResponse
     try {
-      const [, transactionManager] = await this.ensureStarted()
+      batchResponse = this.queryCompiler!.compileBatch(request)
+    } catch (err) {
+      throw this.#transformCompileError(err)
+    }
 
-      const response = await this.queryCompiler!.compileBatch(request)
-
+    try {
       let txInfo: InteractiveTransactionInfo<undefined>
       if (transaction?.kind === 'itx') {
         // If we are already in an interactive transaction we do not nest transactions
@@ -331,19 +406,19 @@ export class ClientEngine implements Engine<undefined> {
 
       // TODO: ORM-508 - Implement query plan caching by replacing all scalar values in the query with params automatically.
       const placeholderValues = {}
-      const interpreter = new QueryInterpreter({
+      const interpreter = QueryInterpreter.forSql({
         transactionManager: { enabled: false },
         placeholderValues,
         onQuery: this.#emitQueryEvent,
         tracingHelper: this.tracingHelper,
       })
-      const queryable = transactionManager.getTransaction(txInfo, firstAction)
+      const queryable = transactionManager.getTransaction(txInfo, 'batch query')
 
       let results: BatchQueryEngineResult<unknown>[] = []
-      switch (response.type) {
+      switch (batchResponse.type) {
         case 'multi': {
           results = await Promise.all(
-            response.plans.map(async (plan, i) => {
+            batchResponse.plans.map(async (plan, i) => {
               const rows = await interpreter.run(plan as QueryPlanNode, queryable)
               return { data: { [queries[i].action]: rows } }
             }),
@@ -355,8 +430,8 @@ export class ClientEngine implements Engine<undefined> {
             throw new Error('All queries in a batch must have the same action')
           }
 
-          const rows = await interpreter.run(response.plan as QueryPlanNode, queryable)
-          results = this.#convertCompactedRows(rows as {}[], response, firstAction)
+          const rows = await interpreter.run(batchResponse.plan as QueryPlanNode, queryable)
+          results = this.#convertCompactedRows(rows as {}[], batchResponse, firstAction)
           break
         }
       }
@@ -367,7 +442,7 @@ export class ClientEngine implements Engine<undefined> {
 
       return results as BatchQueryEngineResult<T>[]
     } catch (e: any) {
-      throw this.transformRequestError(e)
+      throw this.#transformRequestError(e)
     }
   }
 
@@ -399,8 +474,7 @@ export class ClientEngine implements Engine<undefined> {
     return response.arguments.map((args) => {
       // we find the index of the row that matches the input arguments - this is the row we want
       // to return minus any extra columns not present in the selection
-      const argsAsObject = Object.fromEntries(args)
-      const rowIndex = keysPerRow.findIndex((rowKeys) => doKeysMatch(rowKeys, argsAsObject))
+      const rowIndex = keysPerRow.findIndex((rowKeys) => doKeysMatch(rowKeys, args))
       if (rowIndex === -1) {
         if (response.expectNonEmpty) {
           return new PrismaClientKnownRequestError(
